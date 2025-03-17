@@ -25,6 +25,7 @@ from private_gpt.server.ingest.ingest_service import IngestService
 from private_gpt.server.recipes.summarize.summarize_service import SummarizeService
 from private_gpt.settings.settings import settings
 from private_gpt.ui.images import logo_svg
+from private_gpt.ui.ui_utils import chat_all
 
 logger = logging.getLogger(__name__)
 
@@ -387,10 +388,11 @@ class PrivateGptUi:
             ".footer { text-align: center; margin-top: 20px; font-size: 14px; display: flex; align-items: center; justify-content: center; }"
             ".footer-zylon-link { display:flex; margin-left: 5px; text-decoration: auto; color: var(--body-text-color); }"
             ".footer-zylon-link:hover { color: #C7BAFF; }"
-            ".footer-zylon-ico { height: 20px; margin-left: 5px; background-color: antiquewhite; border-radius: 2px; }",
+            ".footer-zylon-ico { height: 20px; margin-left: 5px; background-color: antiquewhite; border-radius: 2px; }"
+            ".custom-box { flex-grow: 1; overflow: auto; background-color: white; border-radius: 8px; padding: 20px; min-height: 300px; width: 100%; height: 100%; #ccc; align-items: center; justify-content: center; }",
         ) as blocks:
             with gr.Row():
-                gr.HTML(f"<div class='logo'/><img src={logo_svg} alt=PrivateGPT></div")
+                gr.HTML(f"<div class='logo'/>DeepSearch</div>")
 
             with gr.Row(equal_height=False):
                 with gr.Column(scale=3):
@@ -536,9 +538,11 @@ class PrivateGptUi:
 
                         return model_mapping[llm_mode]
 
-                with gr.Column(scale=7, elem_id="col"):
+                with gr.Column(scale=12, elem_id="col"):
                     # Determine the model label based on the value of PGPT_PROFILES
+                    # TODO: Modify this part so that it supports a list
                     model_label = get_model_label()
+                    method_labels = ["RAG", "PCA", "DeepSearch"]
                     if model_label is not None:
                         label_text = (
                             f"LLM: {settings().llm.mode} | Model: {model_label}"
@@ -546,27 +550,45 @@ class PrivateGptUi:
                     else:
                         label_text = f"LLM: {settings().llm.mode}"
 
-                    _ = gr.ChatInterface(
-                        self._chat,
-                        chatbot=gr.Chatbot(
-                            label=label_text,
-                            show_copy_button=True,
-                            elem_id="chatbot",
-                            render=False,
-                            avatar_images=(
-                                None,
-                                AVATAR_BOT,
-                            ),
-                        ),
-                        additional_inputs=[mode, upload_button, system_prompt_input],
-                    )
+                    chatbots = []
+                    chatinterface = None
+                    for idx, method in enumerate(method_labels):
+                        with gr.Row():
+                            with gr.Column(scale=3):
+                                chatbot = None
+                                if idx != len(method_labels) - 1:
+                                    chatbot = gr.Chatbot(
+                                        height=300,
+                                        label=f"{method}",
+                                        show_copy_button=True,
+                                        elem_id="chatbot",
+                                        render=True,
+                                        avatar_images=(None, AVATAR_BOT),
+                                    )
+                                else:
+                                    chatbot = gr.Chatbot(
+                                        height=300,
+                                        label=f"{method}",
+                                        show_copy_button=True,
+                                        elem_id="chatbot",
+                                        render=False,
+                                        avatar_images=(None, AVATAR_BOT),
+                                    )
+                                    chatinterface = gr.ChatInterface(
+                                        self._chat,
+                                        chatbot=chatbot,
+                                    )
+                                chatbots.append(chatbot)
+                            with gr.Column(scale=1):
+                                gr.HTML('<div class="custom-box">Visualization Here</div>')
 
-            with gr.Row():
-                avatar_byte = AVATAR_BOT.read_bytes()
-                f_base64 = f"data:image/png;base64,{base64.b64encode(avatar_byte).decode('utf-8')}"
-                gr.HTML(
-                    f"<div class='footer'><a class='footer-zylon-link' href='https://zylon.ai/'>Maintained by Zylon <img class='footer-zylon-ico' src='{f_base64}' alt=Zylon></a></div>"
-                )
+
+            # with gr.Row():
+            #     avatar_byte = AVATAR_BOT.read_bytes()
+            #     f_base64 = f"data:image/png;base64,{base64.b64encode(avatar_byte).decode('utf-8')}"
+            #     gr.HTML(
+            #         f"<div class='footer'><a class='footer-zylon-link' href='https://zylon.ai/'>Maintained by Zylon <img class='footer-zylon-ico' src='{f_base64}' alt=Zylon></a></div>"
+            #     )
 
         return blocks
 

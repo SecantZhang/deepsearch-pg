@@ -98,7 +98,18 @@ huggingface:
   trust_remote_code: true
 
 vectorstore:
-  database: qdrant
+#  database: qdrant
+  databases:
+    original:
+      type: qdrant
+      url: "http://localhost:6333"
+    pca:
+      type: qdrant
+      url: "http://localhost:6334"
+    umap:
+      type: qdrant
+      url: "http://localhost:6335"
+
 
 nodestore:
   database: simple
@@ -108,8 +119,8 @@ milvus:
   collection_name: milvus_db
   overwrite: false
 
-qdrant:
-  path: local_data/private_gpt/qdrant
+#qdrant:
+#  path: local_data/private_gpt/qdrant
 
 postgres:
   host: localhost

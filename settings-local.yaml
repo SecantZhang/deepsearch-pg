@@ -23,5 +23,5 @@ huggingface:
 vectorstore:
   database: qdrant
 
-qdrant:
-  path: local_data/private_gpt/qdrant
+#qdrant:
+#  path: local_data/private_gpt/qdrant

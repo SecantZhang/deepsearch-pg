@@ -7,6 +7,8 @@ from collections.abc import Iterable
 from enum import Enum
 from pathlib import Path
 from typing import Any
+import requests
+import asyncio
 
 import gradio as gr  # type: ignore
 from fastapi import FastAPI
@@ -25,6 +27,8 @@ from private_gpt.server.ingest.ingest_service import IngestService
 from private_gpt.server.recipes.summarize.summarize_service import SummarizeService
 from private_gpt.settings.settings import settings
 from private_gpt.ui.images import logo_svg
+
+from private_gpt.search_pipeline import search_pipeline
 
 logger = logging.getLogger(__name__)
 
@@ -98,6 +102,7 @@ class PrivateGptUi:
         self._ui_block = None
 
         self._selected_filename = None
+        self._selected_method = "original"
 
         # Initialize system prompt based on default mode
         default_mode_map = {mode.value: mode for mode in Modes}
@@ -106,9 +111,49 @@ class PrivateGptUi:
         )
         self._system_prompt = self._get_default_system_prompt(self._default_mode)
 
+        # We'll store a reference to the ingested_dataset Gradio List,
+        # so we can manually call .update(...) after uploading a new file programmatically.
+        self._ingested_dataset_component = None
+
+    def _refresh_list(self) -> list[list[str]]:
+        return self._list_ingested_files()
+
     def _chat(
         self, message: str, history: list[list[str]], mode: Modes, *_: Any
     ) -> Any:
+        """
+        Called on each user message. We'll do the same existing logic but:
+          - generate a 'generated_search.txt' from pipeline
+          - call _upload_file([...])
+          - force the 'Ingested Files' list to refresh by calling .update(...)
+        """
+        if not message.strip():
+            # If user typed nothing, do nothing special
+            pass
+        else:
+            # Did the user pick a file on the left panel?
+            if self._selected_filename is None:
+                # (A) No file is selected => generate a new file
+                top_texts = search_pipeline(query_text=message, method=self._selected_method)
+                import time, os
+                timestamp = int(time.time())
+                out_path = f"generated_search_{self._selected_method}_{timestamp}.txt"
+
+                with open(out_path, "w", encoding="utf-8") as f:
+                    for txt in top_texts:
+                        f.write(txt + "\n\n")
+
+                # Upload the new file
+                self._upload_file([out_path])
+
+                # Temporarily set it as selected for the current RAG query
+                just_name = os.path.basename(out_path)
+                self._selected_filename = just_name
+
+            else:
+                # (B) A file is already selected => skip pipeline generation
+                pass
+
         def yield_deltas(completion_gen: CompletionGen) -> Iterable[str]:
             full_response: str = ""
             stream = completion_gen.response
@@ -118,7 +163,7 @@ class PrivateGptUi:
                 elif isinstance(delta, ChatResponse):
                     full_response += delta.delta or ""
                 yield full_response
-                time.sleep(0.02)
+                # time.sleep(0.02)
 
             if completion_gen.sources:
                 full_response += SOURCES_SEPARATOR
@@ -192,6 +237,10 @@ class PrivateGptUi:
                     context_filter=context_filter,
                 )
                 yield from yield_deltas(query_stream)
+                if self._selected_filename and "generated_search_" in self._selected_filename:
+                    # This indicates we just created a new file for this query
+                    self._selected_filename = None
+
             case Modes.BASIC_CHAT_MODE:
                 llm_stream = self._chat_service.stream_chat(
                     messages=all_messages,
@@ -297,6 +346,8 @@ class PrivateGptUi:
 
     def _upload_file(self, files: list[str]) -> None:
         logger.debug("Loading count=%s files", len(files))
+        from pathlib import Path
+
         paths = [Path(file) for file in files]
 
         # remove all existing Documents with name identical to a new file upload:
@@ -363,6 +414,22 @@ class PrivateGptUi:
             gr.components.Textbox(self._selected_filename),
         ]
 
+    def _switch_vector_store(self, method_name: str) -> str:
+        self._selected_method = method_name
+        try:
+            response = requests.post(
+                "http://localhost:8001/switch_vector_store",
+                json={"method": method_name},
+                timeout=10
+            )
+            if response.ok:
+                data = response.json()
+                return data.get("message", "No message returned.")
+            else:
+                return f"Error: {response.status_code} - {response.text}"
+        except Exception as e:
+            return f"Request error: {e}"
+
     def _build_ui_blocks(self) -> gr.Blocks:
         logger.debug("Creating the UI blocks")
         with gr.Blocks(
@@ -414,37 +481,45 @@ class PrivateGptUi:
                         file_count="multiple",
                         size="sm",
                     )
-                    ingested_dataset = gr.List(
+
+                    self._ingested_dataset_component = gr.List(
                         self._list_ingested_files,
                         headers=["File name"],
                         label="Ingested Files",
                         height=235,
                         interactive=False,
-                        render=False,  # Rendered under the button
+                        # render=False,  # Rendered under the button
                     )
                     upload_button.upload(
                         self._upload_file,
                         inputs=upload_button,
-                        outputs=ingested_dataset,
+                        outputs=self._ingested_dataset_component,
                     )
-                    ingested_dataset.change(
+
+                    self._ingested_dataset_component.change(
                         self._list_ingested_files,
-                        outputs=ingested_dataset,
+                        outputs=self._ingested_dataset_component,
                     )
-                    ingested_dataset.render()
-                    deselect_file_button = gr.components.Button(
+                    refresh_button = gr.Button("Refresh Files", size="sm")
+                    refresh_button.click(
+                        fn=self._refresh_list,
+                        inputs=[],
+                        outputs=self._ingested_dataset_component
+                    )
+
+                    deselect_file_button = gr.Button(
                         "De-select selected file", size="sm", interactive=False
                     )
-                    selected_text = gr.components.Textbox(
+                    selected_text = gr.Textbox(
                         "All files", label="Selected for Query or Deletion", max_lines=1
                     )
-                    delete_file_button = gr.components.Button(
+                    delete_file_button = gr.Button(
                         "🗑️ Delete selected file",
                         size="sm",
                         visible=settings().ui.delete_file_button_enabled,
                         interactive=False,
                     )
-                    delete_files_button = gr.components.Button(
+                    delete_files_button = gr.Button(
                         "⚠️ Delete ALL files",
                         size="sm",
                         visible=settings().ui.delete_all_files_button_enabled,
@@ -457,7 +532,7 @@ class PrivateGptUi:
                             selected_text,
                         ],
                     )
-                    ingested_dataset.select(
+                    self._ingested_dataset_component.select(
                         fn=self._selected_a_file,
                         outputs=[
                             delete_file_button,
@@ -468,7 +543,7 @@ class PrivateGptUi:
                     delete_file_button.click(
                         self._delete_selected_file,
                         outputs=[
-                            ingested_dataset,
+                            self._ingested_dataset_component,
                             delete_file_button,
                             deselect_file_button,
                             selected_text,
@@ -477,7 +552,7 @@ class PrivateGptUi:
                     delete_files_button.click(
                         self._delete_all_files,
                         outputs=[
-                            ingested_dataset,
+                            self._ingested_dataset_component,
                             delete_file_button,
                             deselect_file_button,
                             selected_text,
@@ -549,8 +624,50 @@ class PrivateGptUi:
                         label_text = f"LLM: {settings().llm.mode}"
 
                     with gr.Row():
-                        for i in range(3):
-                            gr.Button(f"Visualization {i}\n\n\n", elem_id="custom-box", size="lg", elem_classes=["square-button"])
+                        original_btn = gr.Button("Original", size="lg", elem_classes=["square-button"],
+                                                 variant="primary")
+                        pca_btn = gr.Button("PCA", size="lg", elem_classes=["square-button"], variant="secondary")
+                        umap_btn = gr.Button("UMAP", size="lg", elem_classes=["square-button"], variant="secondary")
+
+                    # Function to update button styles based on selected
+                    def update_button_styles(selected: str):
+                        def get_variant(name):
+                            return gr.update(variant="primary") if name == selected else gr.update(variant="secondary")
+
+                        return [get_variant("original"), get_variant("pca"), get_variant("umap")]
+
+                    # Function to combine backend call and return selected method
+                    def handle_button_click(method: str):
+                        self._switch_vector_store(method)
+                        return method  # used to update button styles
+
+                    # Wire the buttons
+                    original_btn.click(
+                        fn=lambda: handle_button_click("original"),
+                        outputs=None
+                    ).then(
+                        fn=update_button_styles,
+                        inputs=None,
+                        outputs=[original_btn, pca_btn, umap_btn]
+                    )
+
+                    pca_btn.click(
+                        fn=lambda: handle_button_click("pca"),
+                        outputs=None
+                    ).then(
+                        fn=update_button_styles,
+                        inputs=None,
+                        outputs=[original_btn, pca_btn, umap_btn]
+                    )
+
+                    umap_btn.click(
+                        fn=lambda: handle_button_click("umap"),
+                        outputs=None
+                    ).then(
+                        fn=update_button_styles,
+                        inputs=None,
+                        outputs=[original_btn, pca_btn, umap_btn]
+                    )
 
                     with gr.Column():
                         _ = gr.ChatInterface(
@@ -566,6 +683,7 @@ class PrivateGptUi:
                                 ),
                             ),
                             additional_inputs=[mode, upload_button, system_prompt_input],
+                            # outputs=[self._ingested_dataset_component],
                         )
 
         return blocks
@@ -583,6 +701,7 @@ class PrivateGptUi:
 
 
 if __name__ == "__main__":
+    from private_gpt.di import global_injector
     ui = global_injector.get(PrivateGptUi)
     _blocks = ui.get_ui_blocks()
     _blocks.queue()

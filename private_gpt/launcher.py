@@ -16,6 +16,7 @@ from private_gpt.server.embeddings.embeddings_router import embeddings_router
 from private_gpt.server.health.health_router import health_router
 from private_gpt.server.ingest.ingest_router import ingest_router
 from private_gpt.server.recipes.summarize.summarize_router import summarize_router
+from private_gpt.server.vector_store.vector_store_router import vector_store_router
 from private_gpt.settings.settings import Settings
 
 logger = logging.getLogger(__name__)
@@ -36,6 +37,7 @@ def create_app(root_injector: Injector) -> FastAPI:
     app.include_router(summarize_router)
     app.include_router(embeddings_router)
     app.include_router(health_router)
+    app.include_router(vector_store_router)
 
     # Add LlamaIndex simple observability
     global_handler = create_global_handler("simple")

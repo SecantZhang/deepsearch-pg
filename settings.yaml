@@ -99,16 +99,18 @@ huggingface:
 
 vectorstore:
 #  database: qdrant
-  databases:
-    original:
-      type: qdrant
-      url: "http://localhost:6333"
-    pca:
-      type: qdrant
-      url: "http://localhost:6334"
-    umap:
-      type: qdrant
-      url: "http://localhost:6335"
+#  databases:
+#    original:
+#      type: qdrant
+#      url: "http://localhost:6333"
+#    pca:
+#      type: qdrant
+#      url: "http://localhost:6334"
+#    umap:
+#      type: qdrant
+#      url: "http://localhost:6335"
+  database: "qdrant"
+
 
 
 nodestore:

@@ -1,78 +1,69 @@
-"""
-search_pipeline.py
-
-Generates a query vector in 384-d, optionally reduces it to 64-d via PCA or UMAP,
-searches the correct Qdrant instance for top-K results, and returns the original
-Wikipedia articles from a local dataset subset.
-
-No file output, no main() function. Just a library function `search_pipeline()`.
-"""
-
 import os
+import time
 import numpy as np
 import joblib
 from datasets import Dataset, load_from_disk
 from sentence_transformers import SentenceTransformer
 from qdrant_client import QdrantClient
 from qdrant_client.models import ScoredPoint
-
-from sklearn.decomposition import PCA  # We'll re-fit PCA from the original array
+import traceback
+from sklearn.decomposition import PCA
 import umap
 
-# import os
-# print("Current Working Directory:", os.getcwd())
+import tensorflow as tf
+from tensorflow import keras
 
 # ========== CONFIG ==========
+
 DATA_DIR = "private_gpt/data"
 DATASET_DIR = os.path.join(DATA_DIR, "wikipedia_subset_dataset")
 
-ORIGINAL_EMB_FILE = os.path.join(DATA_DIR, "wikipedia_original_embeddings.npy")
-UMAP_MODEL_FILE   = os.path.join(DATA_DIR, "umap_reducer.joblib")
+ORIGINAL_EMB_FILE   = os.path.join(DATA_DIR, "wikipedia_original_embeddings.npy")
+PCA_DIM             = 64
+UMAP_MODEL_FILE     = os.path.join(DATA_DIR, "umap_reducer.joblib")
+AE_MODEL_DIR        = os.path.join(DATA_DIR, "encoder_savedmodel")  # from your create-ae-embedding script
 
-# Dimensions
-ORIGINAL_DIM = 384  # "all-MiniLM-L6-v2" outputs
-PCA_DIM = 64
-UMAP_DIM = 64
+TOP_K = 10
 
 # Qdrant ports + collections for each method
 QDRANT_PORTS = {
     "original": 6333,
     "pca":      6334,
-    "umap":     6335
+    "umap":     6335,
+    "ae":       6336
 }
 QDRANT_COLLECTIONS = {
     "original": "wikipedia_original",
     "pca":      "wikipedia_pca",
-    "umap":     "wikipedia_umap"
+    "umap":     "wikipedia_umap",
+    "ae":       "wikipedia_ae"
 }
 
-TOP_K = 10
-
-# ========== LOAD OR CACHE ==========
+# ========== LOAD DATA / MODELS ==========
 
 print(f"[INFO] Checking dataset folder at: {DATASET_DIR}")
 if not os.path.exists(DATASET_DIR):
     raise RuntimeError(f"Dataset dir '{DATASET_DIR}' not found. Did you run ingestion?")
 
-print(f"[INFO] Loading partial Wikipedia subset from disk...")
+print("[INFO] Loading partial Wikipedia subset from disk...")
 dataset: Dataset = load_from_disk(DATASET_DIR)
 print(f"[INFO] Dataset length = {len(dataset)} articles")
 
 print("[INFO] Initializing the base embedding model: all-MiniLM-L6-v2")
 base_embed_model = SentenceTransformer("sentence-transformers/all-MiniLM-L6-v2")
 
-# 1) Load original embeddings so we can re-fit PCA
+# Load original embeddings so we can re-fit PCA
 if not os.path.exists(ORIGINAL_EMB_FILE):
     raise RuntimeError(f"Cannot find {ORIGINAL_EMB_FILE}, aborting.")
 original_embeddings = np.load(ORIGINAL_EMB_FILE)
 print(f"[INFO] Original embeddings shape = {original_embeddings.shape}")
 
-# 2) Fit or re-fit PCA(64) from the original array
-print("[INFO] Re-fitting PCA(64) from original array, so we can transform queries.")
+# Fit PCA(64) from the original array
+print("[INFO] Fitting PCA(64) from original array...")
 pca_model = PCA(n_components=PCA_DIM, random_state=42)
 pca_model.fit(original_embeddings)
 
-# 3) Load UMAP if present
+# Load UMAP if present
 umap_reducer = None
 if os.path.exists(UMAP_MODEL_FILE):
     print(f"[INFO] Loading UMAP reducer from {UMAP_MODEL_FILE} ...")
@@ -80,54 +71,139 @@ if os.path.exists(UMAP_MODEL_FILE):
 else:
     print("[WARN] No umap_reducer.joblib found. 'umap' method won't be available.")
 
-print("[INFO] Setup complete. We can now do search queries with original/pca/umap.")
+# Load AE model if present
+ae_encoder = None
+if os.path.isdir(AE_MODEL_DIR):
+    print(f"[INFO] Loading AE encoder from {AE_MODEL_DIR} ...")
+    try:
+        ae_encoder = keras.models.load_model(AE_MODEL_DIR)
+    except Exception as e:
+        # print(f"[WARN] Could not load AE model: {e}")
+        print(f"[ERROR] Failed to load AE model:")
+        traceback.print_exc()
+else:
+    print("[WARN] No AE model directory found at {AE_MODEL_DIR}. 'ae' method won't be available.")
+
+print("[INFO] Setup complete. We can now do multi-method searches (original/pca/umap/ae).")
 
 
-def search_pipeline(query_text: str, method: str = "original") -> list[str]:
+# ========== HELPER FUNCTIONS ==========
+
+def _transform_query(query_384: np.ndarray, method: str) -> np.ndarray:
     """
-    1) Embed query (384-d) via all-MiniLM-L6-v2.
-    2) If method=='pca', reduce to 64-d via pca_model.
-       If method=='umap', reduce to 64-d via umap_reducer.
-       If 'original', keep 384-d.
-    3) Search correct Qdrant instance (port 6333, 6334, 6335).
-    4) Retrieve top-K indices, then fetch 'dataset[idx]["text"]'.
-    5) Return list of article texts.
+    Helper to apply dimension reduction based on 'method'.
+    - 'original' -> no reduction
+    - 'pca'      -> PCA(64)
+    - 'umap'     -> UMAP(64) if available
+    - 'ae'       -> AE(64) if available
     """
-    print("Selected method: ", method)
-    # 1) embed
-    query_384 = base_embed_model.encode(query_text).astype(np.float32)
-    # 2) dimension reduction
     if method == "pca":
-        query_vec = pca_model.transform(query_384.reshape(1, -1)).astype(np.float32)[0]
+        return pca_model.transform(query_384.reshape(1, -1)).astype(np.float32)[0]
+
     elif method == "umap":
         if umap_reducer is None:
             raise RuntimeError("UMAP reducer not loaded, cannot do 'umap' method.")
-        query_vec = umap_reducer.transform(query_384.reshape(1, -1)).astype(np.float32)[0]
+        return umap_reducer.transform(query_384.reshape(1, -1)).astype(np.float32)[0]
+
+    elif method == "ae":
+        if ae_encoder is None:
+            raise RuntimeError("AE model not loaded, cannot do 'ae' method.")
+        # AE encoder expects shape [batch_size, 384], returns shape [batch_size, 64].
+        # Convert to float32 if needed.
+        query_tensor = tf.convert_to_tensor(query_384.reshape(1, -1), dtype=tf.float32)
+        ae_out = ae_encoder(query_tensor, training=False)
+        return ae_out.numpy().astype(np.float32)[0]
+
     else:
-        # 'original'
-        query_vec = query_384
+        # 'original' => no reduction
+        return query_384
 
-    # 3) pick Qdrant server
-    if method not in QDRANT_PORTS:
-        raise ValueError(f"Unknown method: {method}")
 
-    port = QDRANT_PORTS[method]
-    collection_name = QDRANT_COLLECTIONS[method]
-    client = QdrantClient(host="localhost", port=port)
+# ========== MAIN SEARCH FUNCTION ==========
 
-    # 4) search top-K
-    results: list[ScoredPoint] = client.search(
-        collection_name=collection_name,
-        query_vector=query_vec,
-        limit=TOP_K
-    )
-    idx_list = [r.id for r in results]
+def multi_search_pipeline(query_text: str, top_k: int = TOP_K):
+    """
+    Perform retrieval for *all* methods (original, pca, umap, ae) in one go:
+      1) Embed the query to 384-d once via all-MiniLM-L6-v2.
+      2) For each method, reduce dimension if needed, then search its Qdrant instance.
+      3) Record retrieval time, top-K doc IDs, doc texts, etc.
+      4) Compute overlap with 'original' doc IDs (ground truth).
+      5) Return a dict of all results.
 
-    # 5) retrieve from dataset
-    retrieved_texts = []
-    for idx in idx_list:
-        int_idx = int(idx)
-        text_item = dataset[int_idx]["text"]
-        retrieved_texts.append(text_item)
+    Return format:
+    {
+      "original": {
+         "doc_ids":        list[int],
+         "doc_texts":      list[str],
+         "retrieval_time": float,
+         "overlap_count":  int,
+         "overlap_list":   list[bool]
+      },
+      "pca": { ... },
+      "umap": { ... },
+      "ae":   { ... }
+    }
+    """
+    # Define which methods to attempt
+    all_methods = ["original", "pca", "umap", "ae"]
 
-    return retrieved_texts
+    # 1) Embed the user query in 384-d
+    query_384 = base_embed_model.encode(query_text).astype(np.float32)
+
+    results_dict = {}
+
+    # 2) Retrieve for each method
+    for method in all_methods:
+        # Dimension reduction
+        query_vec = _transform_query(query_384, method)
+
+        # Qdrant port & collection
+        if method not in QDRANT_PORTS:
+            raise ValueError(f"Unknown method: {method}")
+        port = QDRANT_PORTS[method]
+        collection_name = QDRANT_COLLECTIONS[method]
+
+        client = QdrantClient(host="localhost", port=port)
+
+        # Time the search
+        start_time = time.time()
+        qdrant_results: list[ScoredPoint] = client.search(
+            collection_name=collection_name,
+            query_vector=query_vec,
+            limit=top_k
+        )
+        end_time = time.time()
+
+        # Gather IDs & texts
+        doc_ids = [int(r.id) for r in qdrant_results]
+        doc_texts = [dataset[idx]["text"] for idx in doc_ids]
+
+        results_dict[method] = {
+            "doc_ids": doc_ids,
+            "doc_texts": doc_texts,
+            "retrieval_time": end_time - start_time
+        }
+
+    # 3) Compute overlap with 'original' ground truth
+    if "original" in results_dict:
+        original_ids = set(results_dict["original"]["doc_ids"])
+        # For 'original' itself
+        results_dict["original"]["overlap_count"] = len(results_dict["original"]["doc_ids"])
+        results_dict["original"]["overlap_list"] = [True] * len(results_dict["original"]["doc_ids"])
+
+        # For each other method
+        for method, data in results_dict.items():
+            if method == "original":
+                continue
+            competitor_ids = data["doc_ids"]
+            overlap = [doc_id in original_ids for doc_id in competitor_ids]
+            overlap_count = sum(overlap)
+            data["overlap_count"] = overlap_count
+            data["overlap_list"] = overlap
+    else:
+        # If original isn't in the dict, no ground truth to compare
+        for method, data in results_dict.items():
+            data["overlap_count"] = 0
+            data["overlap_list"] = [False] * len(data["doc_ids"])
+
+    return results_dict

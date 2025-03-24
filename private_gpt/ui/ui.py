@@ -1,5 +1,3 @@
-"""This file should be imported if and only if you want to run the UI locally."""
-
 import base64
 import logging
 import time
@@ -12,10 +10,8 @@ import asyncio
 
 import gradio as gr  # type: ignore
 from fastapi import FastAPI
-from gradio.themes.utils.colors import slate  # type: ignore
 from injector import inject, singleton
 from llama_index.core.llms import ChatMessage, ChatResponse, MessageRole
-from llama_index.core.types import TokenGen
 from pydantic import BaseModel
 
 from private_gpt.constants import PROJECT_ROOT_PATH
@@ -28,25 +24,22 @@ from private_gpt.server.recipes.summarize.summarize_service import SummarizeServ
 from private_gpt.settings.settings import settings
 from private_gpt.ui.images import logo_svg
 
-from private_gpt.search_pipeline import search_pipeline
+# Multi-method search pipeline – must return a dict with keys "original", "pca", "umap", "ae"
+from private_gpt.search_pipeline import multi_search_pipeline
 
 logger = logging.getLogger(__name__)
+logger.setLevel(logging.DEBUG)
 
 THIS_DIRECTORY_RELATIVE = Path(__file__).parent.relative_to(PROJECT_ROOT_PATH)
-# Should be "private_gpt/ui/avatar-bot.ico"
 AVATAR_BOT = THIS_DIRECTORY_RELATIVE / "avatar-bot.ico"
-
 UI_TAB_TITLE = "My Private GPT"
-
 SOURCES_SEPARATOR = "<hr>Sources: \n"
-
 
 class Modes(str, Enum):
     RAG_MODE = "RAG"
     SEARCH_MODE = "Search"
     BASIC_CHAT_MODE = "Basic"
     SUMMARIZE_MODE = "Summarize"
-
 
 MODES: list[Modes] = [
     Modes.RAG_MODE,
@@ -55,7 +48,6 @@ MODES: list[Modes] = [
     Modes.SUMMARIZE_MODE,
 ]
 
-
 class Source(BaseModel):
     file: str
     page: str
@@ -63,25 +55,6 @@ class Source(BaseModel):
 
     class Config:
         frozen = True
-
-    @staticmethod
-    def curate_sources(sources: list[Chunk]) -> list["Source"]:
-        curated_sources = []
-
-        for chunk in sources:
-            doc_metadata = chunk.document.doc_metadata
-
-            file_name = doc_metadata.get("file_name", "-") if doc_metadata else "-"
-            page_label = doc_metadata.get("page_label", "-") if doc_metadata else "-"
-
-            source = Source(file=file_name, page=page_label, text=chunk.text)
-            curated_sources.append(source)
-            curated_sources = list(
-                dict.fromkeys(curated_sources).keys()
-            )  # Unique sources only
-
-        return curated_sources
-
 
 @singleton
 class PrivateGptUi:
@@ -98,11 +71,12 @@ class PrivateGptUi:
         self._chunks_service = chunks_service
         self._summarize_service = summarizeService
 
-        # Cache the UI blocks
         self._ui_block = None
+        self._selected_filename = None  # (Not used in this RAG-only demo)
 
-        self._selected_filename = None
-        self._selected_method = "original"
+        # For competitor retrieval workflow:
+        self._last_query = ""
+        self._retrieval_results = {}
 
         # Initialize system prompt based on default mode
         default_mode_map = {mode.value: mode for mode in Modes}
@@ -111,192 +85,21 @@ class PrivateGptUi:
         )
         self._system_prompt = self._get_default_system_prompt(self._default_mode)
 
-        # We'll store a reference to the ingested_dataset Gradio List,
-        # so we can manually call .update(...) after uploading a new file programmatically.
         self._ingested_dataset_component = None
 
-    def _refresh_list(self) -> list[list[str]]:
-        return self._list_ingested_files()
-
-    def _chat(
-        self, message: str, history: list[list[str]], mode: Modes, *_: Any
-    ) -> Any:
-        """
-        Called on each user message. We'll do the same existing logic but:
-          - generate a 'generated_search.txt' from pipeline
-          - call _upload_file([...])
-          - force the 'Ingested Files' list to refresh by calling .update(...)
-        """
-        if not message.strip():
-            # If user typed nothing, do nothing special
-            pass
-        else:
-            # Did the user pick a file on the left panel?
-            if self._selected_filename is None:
-                # (A) No file is selected => generate a new file
-                top_texts = search_pipeline(query_text=message, method=self._selected_method)
-                import time, os
-                timestamp = int(time.time())
-                out_path = f"generated_search_{self._selected_method}_{timestamp}.txt"
-
-                with open(out_path, "w", encoding="utf-8") as f:
-                    for txt in top_texts:
-                        f.write(txt + "\n\n")
-
-                # Upload the new file
-                self._upload_file([out_path])
-
-                # Temporarily set it as selected for the current RAG query
-                just_name = os.path.basename(out_path)
-                self._selected_filename = just_name
-
-            else:
-                # (B) A file is already selected => skip pipeline generation
-                pass
-
-        def yield_deltas(completion_gen: CompletionGen) -> Iterable[str]:
-            full_response: str = ""
-            stream = completion_gen.response
-            for delta in stream:
-                if isinstance(delta, str):
-                    full_response += str(delta)
-                elif isinstance(delta, ChatResponse):
-                    full_response += delta.delta or ""
-                yield full_response
-                # time.sleep(0.02)
-
-            if completion_gen.sources:
-                full_response += SOURCES_SEPARATOR
-                cur_sources = Source.curate_sources(completion_gen.sources)
-                sources_text = "\n\n\n"
-                used_files = set()
-                for index, source in enumerate(cur_sources, start=1):
-                    if f"{source.file}-{source.page}" not in used_files:
-                        sources_text = (
-                            sources_text
-                            + f"{index}. {source.file} (page {source.page}) \n\n"
-                        )
-                        used_files.add(f"{source.file}-{source.page}")
-                sources_text += "<hr>\n\n"
-                full_response += sources_text
-            yield full_response
-
-        def yield_tokens(token_gen: TokenGen) -> Iterable[str]:
-            full_response: str = ""
-            for token in token_gen:
-                full_response += str(token)
-                yield full_response
-
-        def build_history() -> list[ChatMessage]:
-            history_messages: list[ChatMessage] = []
-
-            for interaction in history:
-                history_messages.append(
-                    ChatMessage(content=interaction[0], role=MessageRole.USER)
-                )
-                if len(interaction) > 1 and interaction[1] is not None:
-                    history_messages.append(
-                        ChatMessage(
-                            # Remove from history content the Sources information
-                            content=interaction[1].split(SOURCES_SEPARATOR)[0],
-                            role=MessageRole.ASSISTANT,
-                        )
-                    )
-
-            # max 20 messages to try to avoid context overflow
-            return history_messages[:20]
-
-        new_message = ChatMessage(content=message, role=MessageRole.USER)
-        all_messages = [*build_history(), new_message]
-        # If a system prompt is set, add it as a system message
-        if self._system_prompt:
-            all_messages.insert(
-                0,
-                ChatMessage(
-                    content=self._system_prompt,
-                    role=MessageRole.SYSTEM,
-                ),
-            )
-        match mode:
-            case Modes.RAG_MODE:
-                # Use only the selected file for the query
-                context_filter = None
-                if self._selected_filename is not None:
-                    docs_ids = []
-                    for ingested_document in self._ingest_service.list_ingested():
-                        if (
-                            ingested_document.doc_metadata["file_name"]
-                            == self._selected_filename
-                        ):
-                            docs_ids.append(ingested_document.doc_id)
-                    context_filter = ContextFilter(docs_ids=docs_ids)
-
-                query_stream = self._chat_service.stream_chat(
-                    messages=all_messages,
-                    use_context=True,
-                    context_filter=context_filter,
-                )
-                yield from yield_deltas(query_stream)
-                if self._selected_filename and "generated_search_" in self._selected_filename:
-                    # This indicates we just created a new file for this query
-                    self._selected_filename = None
-
-            case Modes.BASIC_CHAT_MODE:
-                llm_stream = self._chat_service.stream_chat(
-                    messages=all_messages,
-                    use_context=False,
-                )
-                yield from yield_deltas(llm_stream)
-
-            case Modes.SEARCH_MODE:
-                response = self._chunks_service.retrieve_relevant(
-                    text=message, limit=4, prev_next_chunks=0
-                )
-
-                sources = Source.curate_sources(response)
-
-                yield "\n\n\n".join(
-                    f"{index}. **{source.file} "
-                    f"(page {source.page})**\n "
-                    f"{source.text}"
-                    for index, source in enumerate(sources, start=1)
-                )
-            case Modes.SUMMARIZE_MODE:
-                # Summarize the given message, optionally using selected files
-                context_filter = None
-                if self._selected_filename:
-                    docs_ids = []
-                    for ingested_document in self._ingest_service.list_ingested():
-                        if (
-                            ingested_document.doc_metadata["file_name"]
-                            == self._selected_filename
-                        ):
-                            docs_ids.append(ingested_document.doc_id)
-                    context_filter = ContextFilter(docs_ids=docs_ids)
-
-                summary_stream = self._summarize_service.stream_summarize(
-                    use_context=True,
-                    context_filter=context_filter,
-                    instructions=message,
-                )
-                yield from yield_tokens(summary_stream)
-
-    # On initialization and on mode change, this function set the system prompt
-    # to the default prompt based on the mode (and user settings).
+    # --------------------------------------------------------------------------
+    # Helper: Default system prompt and mode explanation.
+    # --------------------------------------------------------------------------
     @staticmethod
     def _get_default_system_prompt(mode: Modes) -> str:
         p = ""
         match mode:
-            # For query chat mode, obtain default system prompt from settings
             case Modes.RAG_MODE:
                 p = settings().ui.default_query_system_prompt
-            # For chat mode, obtain default system prompt from settings
             case Modes.BASIC_CHAT_MODE:
                 p = settings().ui.default_chat_system_prompt
-            # For summarization mode, obtain default system prompt from settings
             case Modes.SUMMARIZE_MODE:
                 p = settings().ui.default_summarization_system_prompt
-            # For any other mode, clear the system prompt
             case _:
                 p = ""
         return p
@@ -332,25 +135,21 @@ class PrivateGptUi:
             gr.update(value=self._explanation_mode),
         ]
 
+    # --------------------------------------------------------------------------
+    # File ingestion and management methods (unused in this demo)
+    # --------------------------------------------------------------------------
     def _list_ingested_files(self) -> list[list[str]]:
         files = set()
         for ingested_document in self._ingest_service.list_ingested():
             if ingested_document.doc_metadata is None:
-                # Skipping documents without metadata
                 continue
-            file_name = ingested_document.doc_metadata.get(
-                "file_name", "[FILE NAME MISSING]"
-            )
+            file_name = ingested_document.doc_metadata.get("file_name", "[FILE NAME MISSING]")
             files.add(file_name)
         return [[row] for row in files]
 
     def _upload_file(self, files: list[str]) -> None:
-        logger.debug("Loading count=%s files", len(files))
         from pathlib import Path
-
         paths = [Path(file) for file in files]
-
-        # remove all existing Documents with name identical to a new file upload:
         file_names = [path.name for path in paths]
         doc_ids_to_delete = []
         for ingested_document in self._ingest_service.list_ingested():
@@ -359,19 +158,18 @@ class PrivateGptUi:
                 and ingested_document.doc_metadata["file_name"] in file_names
             ):
                 doc_ids_to_delete.append(ingested_document.doc_id)
-        if len(doc_ids_to_delete) > 0:
-            logger.info(
-                "Uploading file(s) which were already ingested: %s document(s) will be replaced.",
-                len(doc_ids_to_delete),
-            )
+        if doc_ids_to_delete:
+            logger.info("Replacing %s existing documents.", len(doc_ids_to_delete))
             for doc_id in doc_ids_to_delete:
                 self._ingest_service.delete(doc_id)
-
         self._ingest_service.bulk_ingest([(str(path.name), path) for path in paths])
+
+    def _refresh_list(self) -> list[list[str]]:
+        return self._list_ingested_files()
 
     def _delete_all_files(self) -> Any:
         ingested_files = self._ingest_service.list_ingested()
-        logger.debug("Deleting count=%s files", len(ingested_files))
+        logger.debug("Deleting %s files", len(ingested_files))
         for ingested_document in ingested_files:
             self._ingest_service.delete(ingested_document.doc_id)
         return [
@@ -382,14 +180,9 @@ class PrivateGptUi:
         ]
 
     def _delete_selected_file(self) -> Any:
-        logger.debug("Deleting selected %s", self._selected_filename)
-        # Note: keep looping for pdf's (each page became a Document)
+        logger.debug("Deleting selected file: %s", self._selected_filename)
         for ingested_document in self._ingest_service.list_ingested():
-            if (
-                ingested_document.doc_metadata
-                and ingested_document.doc_metadata["file_name"]
-                == self._selected_filename
-            ):
+            if ingested_document.doc_metadata and ingested_document.doc_metadata["file_name"] == self._selected_filename:
                 self._ingest_service.delete(ingested_document.doc_id)
         return [
             gr.List(self._list_ingested_files()),
@@ -414,58 +207,229 @@ class PrivateGptUi:
             gr.components.Textbox(self._selected_filename),
         ]
 
-    def _switch_vector_store(self, method_name: str) -> str:
-        self._selected_method = method_name
-        try:
-            response = requests.post(
-                "http://localhost:8001/switch_vector_store",
-                json={"method": method_name},
-                timeout=10
-            )
-            if response.ok:
-                data = response.json()
-                return data.get("message", "No message returned.")
-            else:
-                return f"Error: {response.status_code} - {response.text}"
-        except Exception as e:
-            return f"Request error: {e}"
+    # --------------------------------------------------------------------------
+    # Helper function: yield_deltas (as in the old version)
+    # --------------------------------------------------------------------------
+    def yield_deltas(self, completion_gen: CompletionGen) -> Iterable[str]:
+        full_response = ""
+        stream = completion_gen.response
+        for delta in stream:
+            if isinstance(delta, str):
+                full_response += str(delta)
+            elif isinstance(delta, ChatResponse):
+                full_response += delta.delta or ""
+            yield full_response
+            # time.sleep(0.02)
 
+    # --------------------------------------------------------------------------
+    # Multi-method retrieval workflow
+    # --------------------------------------------------------------------------
+    # def run_retrieval(self, query: str) -> tuple:
+    #     """
+    #     When the user clicks "Run Retrieval", call multi_search_pipeline,
+    #     store the results, and return HTML strings for each competitor box.
+    #     """
+    #     if not query.strip():
+    #         return ("<p>Please enter a valid query.</p>", "", "", "")
+    #     self._last_query = query
+    #     try:
+    #         logger.debug("Running multi_search_pipeline with query: %s", query)
+    #         results = multi_search_pipeline(query_text=query)
+    #         self._retrieval_results = results
+    #
+    #         html_original = self._format_box("original", results.get("original"))
+    #         html_pca = self._format_box("pca", results.get("pca"))
+    #         html_umap = self._format_box("umap", results.get("umap"))
+    #         html_ae = self._format_box("ae", results.get("ae"))
+    #         return (html_original, html_pca, html_umap, html_ae)
+    #     except Exception as e:
+    #         logger.exception("Error during retrieval")
+    #         return (f"<p>Error: {e}</p>", "", "", "")
+    def run_retrieval(self, query: str) -> tuple:
+        """
+        When the user clicks "Run Retrieval", call multi_search_pipeline,
+        store the results, and save the top-K documents for each method as files.
+        """
+        if not query.strip():
+            return ("<p>Please enter a valid query.</p>", "", "", "")
+        self._last_query = query
+        try:
+            logger.debug("Running multi_search_pipeline with query: %s", query)
+            results = multi_search_pipeline(query_text=query)
+            self._retrieval_results = results
+
+            # Save the top-K documents for each method as files
+            timestamp = int(time.time())
+            for method, data in results.items():
+                doc_texts = data.get("doc_texts", [])
+                if not doc_texts:
+                    continue
+                out_path = f"generated_search_{method}_{timestamp}.txt"
+                with open(out_path, "w", encoding="utf-8") as f:
+                    for txt in doc_texts:
+                        f.write(txt + "\n\n")
+                # Upload the file to the system
+                self._upload_file([out_path])
+
+            # Return HTML strings for each method
+            html_original = self._format_box("original", results.get("original"))
+            html_pca = self._format_box("pca", results.get("pca"))
+            html_umap = self._format_box("umap", results.get("umap"))
+            html_ae = self._format_box("ae", results.get("ae"))
+            return (html_original, html_pca, html_umap, html_ae)
+        except Exception as e:
+            logger.exception("Error during retrieval")
+            return (f"<p>Error: {e}</p>", "", "", "")
+
+    def _format_box(self, method: str, data: dict) -> str:
+        """
+        Format a competitor box with retrieval info.
+        """
+        if data is None:
+            return f"<p>No data for {method.upper()}.</p>"
+
+        retrieval_time = data.get("retrieval_time", 0)
+        overlap_count = data.get("overlap_count", 0)
+        doc_texts = data.get("doc_texts", [])
+        top_k = len(doc_texts)
+        ratio = (overlap_count / top_k) if top_k > 0 else 0
+
+        if ratio >= 0.7:
+            color = "green"
+        elif ratio >= 0.3:
+            color = "orange"
+        else:
+            color = "red"
+
+        html = (
+            f"<div style='border:1px solid #ccc; padding:10px; margin:5px;'>"
+            f"<h3>{method.upper()}</h3>"
+            f"<p>Retrieval Time: {retrieval_time:.2f} sec</p>"
+            f"<p style='color:{color};'>Overlap: {overlap_count}/{top_k}</p>"
+            f"<div style='max-height:150px; overflow-y:auto; border:1px solid #eee; padding:5px;'>"
+        )
+        overlap_list = data.get("overlap_list", [False] * len(doc_texts))
+        for doc, is_overlap in zip(doc_texts, overlap_list):
+            check = "✓" if is_overlap else ""
+            snippet = doc[:100].replace("\n", " ")
+            html += f"<p>{check} {snippet}...</p>"
+        html += "</div></div>"
+        return html
+
+    def submit_competitor_choice(self, method: str, history: list[list[str]]) -> list[list[str]]:
+        """
+        When a competitor button is clicked, process the query and return the response.
+        """
+        if method not in self._retrieval_results:
+            logger.debug("No retrieval results available for method: %s", method)
+            return history + [[self._last_query, f"No retrieval results available for {method.upper()}."]]
+
+        context_filter = None
+        if self._selected_filename is not None:
+            docs_ids = [
+                ingested_document.doc_id
+                for ingested_document in self._ingest_service.list_ingested()
+                if ingested_document.doc_metadata and ingested_document.doc_metadata[
+                    "file_name"] == self._selected_filename
+            ]
+            if docs_ids:
+                context_filter = ContextFilter(docs_ids=docs_ids)
+
+        messages = []
+        if self._system_prompt:
+            messages.append(ChatMessage(content=self._system_prompt, role=MessageRole.SYSTEM))
+        messages.append(ChatMessage(content=self._last_query, role=MessageRole.USER))
+
+        try:
+            logger.debug("Calling chat for method: %s", method)
+            response = self._chat_service.chat(
+                messages=messages, use_context=True, context_filter=context_filter
+            )
+
+            # Extract the full response content
+            if isinstance(response, ChatResponse):
+                full_response = response.message.content
+            else:
+                full_response = str(response)
+
+            # Append the new interaction to the history
+            return history + [[self._last_query, full_response]]
+
+        except Exception as e:
+            logger.exception("Error during LLM call for method: %s", method)
+            return history + [[self._last_query, f"Error generating answer: {e}"]]
+
+    # def submit_competitor_choice(self, method: str, history: list[list[str]]) -> Iterable[list[list[str]]]:
+    #     if method not in self._retrieval_results:
+    #         yield history + [[self._last_query.strip(), f"No retrieval results for {method.upper()}"]]
+    #         return
+    #
+    #     context_filter = None
+    #     if self._selected_filename:
+    #         docs_ids = [
+    #             doc.doc_id for doc in self._ingest_service.list_ingested()
+    #             if doc.doc_metadata and doc.doc_metadata["file_name"] == self._selected_filename
+    #         ]
+    #         if docs_ids:
+    #             context_filter = ContextFilter(docs_ids=docs_ids)
+    #
+    #     messages = []
+    #     if self._system_prompt:
+    #         messages.append(ChatMessage(content=self._system_prompt, role=MessageRole.SYSTEM))
+    #     messages.append(ChatMessage(content=self._last_query, role=MessageRole.USER))
+    #
+    #     stream = self._chat_service.stream_chat(messages=messages, use_context=True, context_filter=context_filter)
+    #
+    #     assistant_response = ""
+    #     for delta in self.yield_deltas(stream):
+    #         assistant_response = delta.strip()
+    #         if assistant_response:  # only yield non-empty responses
+    #             yield history + [[self._last_query.strip(), assistant_response]]
+    #
+    #     if hasattr(stream, "sources") and stream.sources:
+    #         formatted_sources = self._format_sources(stream.sources)
+    #         assistant_response += f"\n\n**Sources:**\n{formatted_sources}"
+    #         yield history + [[self._last_query.strip(), assistant_response]]
+    #
+    # def _format_sources(self, sources: list[Chunk]) -> str:
+    #     """
+    #     Format sources information into a string.
+    #     """
+    #     formatted_sources = ""
+    #     for i, source in enumerate(sources, start=1):
+    #         file_name = source.document.doc_metadata.get("file_name", "Unknown File")
+    #         page_label = source.document.doc_metadata.get("page_label", "Unknown Page")
+    #         text_snippet = source.text[:100]  # Show a snippet of the source text
+    #         formatted_sources += f"{i}. **{file_name}** (Page {page_label}): {text_snippet}...\n"
+    #     return formatted_sources
+    # --------------------------------------------------------------------------
+    # Build the UI (ChatInterface removed)
+    # --------------------------------------------------------------------------
     def _build_ui_blocks(self) -> gr.Blocks:
         logger.debug("Creating the UI blocks")
         with gr.Blocks(
-            title=UI_TAB_TITLE,
-            theme=gr.themes.Soft(primary_hue=slate),
-            css=".logo { "
-            "display:flex;"
-            "background-color: #C7BAFF;"
-            "height: 80px;"
-            "border-radius: 8px;"
-            "align-content: center;"
-            "justify-content: center;"
-            "align-items: center;"
-            "}"
-            ".logo img { height: 25% }"
-            ".contain { display: flex !important; flex-direction: column !important; }"
-            "#component-0, #component-3, #component-10, #component-8  { height: 100% !important; }"
-            "#chatbot { flex-grow: 1 !important; overflow: auto !important;}"
-            "#col { height: calc(100vh - 112px - 16px) !important; }"
-            "hr { margin-top: 1em; margin-bottom: 1em; border: 0; border-top: 1px solid #FFF; }"
-            ".avatar-image { background-color: antiquewhite; border-radius: 2px; }"
-            ".footer { text-align: center; margin-top: 20px; font-size: 14px; display: flex; align-items: center; justify-content: center; }"
-            ".footer-zylon-link { display:flex; margin-left: 5px; text-decoration: auto; color: var(--body-text-color); }"
-            ".footer-zylon-link:hover { color: #C7BAFF; }"
-            ".footer-zylon-ico { height: 20px; margin-left: 5px; background-color: antiquewhite; border-radius: 2px; }"
-            ".custom-box { flex-grow: 1; overflow: auto; background-color: white; border-radius: 8px; padding: 20px; min-height: 300px; width: 100%; height: 100%; #ccc; align-items: center; justify-content: center; }"
-            ".square-button { height: 250px !important; width: 150px !important; font-size: 16px; text-align: center; border-radius: 10px; cursor: pointer; }",
+                title=UI_TAB_TITLE,
+                theme=gr.themes.Soft(primary_hue="slate"),
+                css="""
+                .logo { 
+                    display: flex;
+                    background-color: #C7BAFF;
+                    height: 80px;
+                    border-radius: 8px;
+                    align-items: center;
+                    justify-content: center;
+                }
+                .logo img { height: 25% }
+                .avatar-image { background-color: antiquewhite; border-radius: 2px; }
+            """
         ) as blocks:
             with gr.Row():
-                gr.HTML(f"<div class='logo'/>DeepSearch</div>")
-
+                gr.HTML(f"<div class='logo'>DeepSearch</div>")
             with gr.Row(equal_height=False):
                 with gr.Column(scale=3):
                     default_mode = self._default_mode
                     mode = gr.Radio(
-                        [mode.value for mode in MODES],
+                        [m.value for m in MODES],
                         label="Mode",
                         value=default_mode,
                     )
@@ -488,7 +452,6 @@ class PrivateGptUi:
                         label="Ingested Files",
                         height=235,
                         interactive=False,
-                        # render=False,  # Rendered under the button
                     )
                     upload_button.upload(
                         self._upload_file,
@@ -507,12 +470,8 @@ class PrivateGptUi:
                         outputs=self._ingested_dataset_component
                     )
 
-                    deselect_file_button = gr.Button(
-                        "De-select selected file", size="sm", interactive=False
-                    )
-                    selected_text = gr.Textbox(
-                        "All files", label="Selected for Query or Deletion", max_lines=1
-                    )
+                    deselect_file_button = gr.Button("De-select selected file", size="sm", interactive=False)
+                    selected_text = gr.Textbox("All files", label="Selected for Query or Deletion", max_lines=1)
                     delete_file_button = gr.Button(
                         "🗑️ Delete selected file",
                         size="sm",
@@ -526,37 +485,21 @@ class PrivateGptUi:
                     )
                     deselect_file_button.click(
                         self._deselect_selected_file,
-                        outputs=[
-                            delete_file_button,
-                            deselect_file_button,
-                            selected_text,
-                        ],
+                        outputs=[delete_file_button, deselect_file_button, selected_text],
                     )
                     self._ingested_dataset_component.select(
                         fn=self._selected_a_file,
-                        outputs=[
-                            delete_file_button,
-                            deselect_file_button,
-                            selected_text,
-                        ],
+                        outputs=[delete_file_button, deselect_file_button, selected_text],
                     )
                     delete_file_button.click(
                         self._delete_selected_file,
-                        outputs=[
-                            self._ingested_dataset_component,
-                            delete_file_button,
-                            deselect_file_button,
-                            selected_text,
-                        ],
+                        outputs=[self._ingested_dataset_component, delete_file_button, deselect_file_button,
+                                 selected_text],
                     )
                     delete_files_button.click(
                         self._delete_all_files,
-                        outputs=[
-                            self._ingested_dataset_component,
-                            delete_file_button,
-                            deselect_file_button,
-                            selected_text,
-                        ],
+                        outputs=[self._ingested_dataset_component, delete_file_button, deselect_file_button,
+                                 selected_text],
                     )
                     system_prompt_input = gr.Textbox(
                         placeholder=self._system_prompt,
@@ -565,128 +508,213 @@ class PrivateGptUi:
                         interactive=True,
                         render=False,
                     )
-                    # When mode changes, set default system prompt, and other stuffs
                     mode.change(
                         self._set_current_mode,
                         inputs=mode,
                         outputs=[system_prompt_input, explanation_mode],
                     )
-                    # On blur, set system prompt to use in queries
                     system_prompt_input.blur(
                         self._set_system_prompt,
                         inputs=system_prompt_input,
                     )
-
-                    def get_model_label() -> str | None:
-                        """Get model label from llm mode setting YAML.
-
-                        Raises:
-                            ValueError: If an invalid 'llm_mode' is encountered.
-
-                        Returns:
-                            str: The corresponding model label.
-                        """
-                        # Get model label from llm mode setting YAML
-                        # Labels: local, openai, openailike, sagemaker, mock, ollama
-                        config_settings = settings()
-                        if config_settings is None:
-                            raise ValueError("Settings are not configured.")
-
-                        # Get llm_mode from settings
-                        llm_mode = config_settings.llm.mode
-
-                        # Mapping of 'llm_mode' to corresponding model labels
-                        model_mapping = {
-                            "llamacpp": config_settings.llamacpp.llm_hf_model_file,
-                            "openai": config_settings.openai.model,
-                            "openailike": config_settings.openai.model,
-                            "azopenai": config_settings.azopenai.llm_model,
-                            "sagemaker": config_settings.sagemaker.llm_endpoint_name,
-                            "mock": llm_mode,
-                            "ollama": config_settings.ollama.llm_model,
-                            "gemini": config_settings.gemini.model,
-                        }
-
-                        if llm_mode not in model_mapping:
-                            print(f"Invalid 'llm mode': {llm_mode}")
-                            return None
-
-                        return model_mapping[llm_mode]
-
-                with gr.Column(scale=7, elem_id="col"):
-                    # Determine the model label based on the value of PGPT_PROFILES
-                    model_label = get_model_label()
-                    if model_label is not None:
-                        label_text = (
-                            f"LLM: {settings().llm.mode} | Model: {model_label}"
-                        )
-                    else:
-                        label_text = f"LLM: {settings().llm.mode}"
-
+                with gr.Column(scale=7):
                     with gr.Row():
-                        original_btn = gr.Button("Original", size="lg", elem_classes=["square-button"],
-                                                 variant="primary")
-                        pca_btn = gr.Button("PCA", size="lg", elem_classes=["square-button"], variant="secondary")
-                        umap_btn = gr.Button("UMAP", size="lg", elem_classes=["square-button"], variant="secondary")
-
-                    # Function to update button styles based on selected
-                    def update_button_styles(selected: str):
-                        def get_variant(name):
-                            return gr.update(variant="primary") if name == selected else gr.update(variant="secondary")
-
-                        return [get_variant("original"), get_variant("pca"), get_variant("umap")]
-
-                    # Function to combine backend call and return selected method
-                    def handle_button_click(method: str):
-                        self._switch_vector_store(method)
-                        return method  # used to update button styles
-
-                    # Wire the buttons
-                    original_btn.click(
-                        fn=lambda: handle_button_click("original"),
-                        outputs=None
-                    ).then(
-                        fn=update_button_styles,
-                        inputs=None,
-                        outputs=[original_btn, pca_btn, umap_btn]
+                        query_input = gr.Textbox(label="Enter Query", placeholder="Type your query here", lines=1)
+                        run_retrieval_btn = gr.Button("Run Retrieval", variant="primary")
+                    with gr.Row():
+                        html_original = gr.HTML(label="Original")
+                        html_pca = gr.HTML(label="PCA")
+                    with gr.Row():
+                        html_umap = gr.HTML(label="UMAP")
+                        html_ae = gr.HTML(label="AE")
+                    with gr.Row():
+                        btn_original = gr.Button("Submit Original")
+                        btn_pca = gr.Button("Submit PCA")
+                        btn_umap = gr.Button("Submit UMAP")
+                        btn_ae = gr.Button("Submit AE")
+                    # Use a Chatbot for displaying LLM answers with streaming updates
+                    competitor_answer = gr.Chatbot(label="LLM Answer", elem_classes=["chatbot"])
+                    run_retrieval_btn.click(
+                        fn=self.run_retrieval,
+                        inputs=query_input,
+                        outputs=[html_original, html_pca, html_umap, html_ae],
                     )
-
-                    pca_btn.click(
-                        fn=lambda: handle_button_click("pca"),
-                        outputs=None
-                    ).then(
-                        fn=update_button_styles,
-                        inputs=None,
-                        outputs=[original_btn, pca_btn, umap_btn]
+                    btn_original.click(
+                        fn=lambda *args: self.submit_competitor_choice("original", history=competitor_answer.value),
+                        inputs=[],
+                        outputs=[competitor_answer],
                     )
-
-                    umap_btn.click(
-                        fn=lambda: handle_button_click("umap"),
-                        outputs=None
-                    ).then(
-                        fn=update_button_styles,
-                        inputs=None,
-                        outputs=[original_btn, pca_btn, umap_btn]
+                    btn_pca.click(
+                        fn=lambda *args: self.submit_competitor_choice("pca", history=competitor_answer.value),
+                        inputs=[],
+                        outputs=[competitor_answer],
                     )
-
-                    with gr.Column():
-                        _ = gr.ChatInterface(
-                            self._chat,
-                            chatbot=gr.Chatbot(
-                                label=label_text,
-                                show_copy_button=True,
-                                elem_id="chatbot",
-                                render=False,
-                                avatar_images=(
-                                    None,
-                                    AVATAR_BOT,
-                                ),
-                            ),
-                            additional_inputs=[mode, upload_button, system_prompt_input],
-                            # outputs=[self._ingested_dataset_component],
-                        )
+                    btn_umap.click(
+                        fn=lambda *args: self.submit_competitor_choice("umap", history=competitor_answer.value),
+                        inputs=[],
+                        outputs=[competitor_answer],
+                    )
+                    btn_ae.click(
+                        fn=lambda *args: self.submit_competitor_choice("ae", history=competitor_answer.value),
+                        inputs=[],
+                        outputs=[competitor_answer],
+                    )
 
         return blocks
+    # def _build_ui_blocks(self) -> gr.Blocks:
+    #     logger.debug("Creating the UI blocks")
+    #     with gr.Blocks(
+    #         title=UI_TAB_TITLE,
+    #         theme=gr.themes.Soft(primary_hue="slate"),
+    #         css="""
+    #             .logo {
+    #                 display: flex;
+    #                 background-color: #C7BAFF;
+    #                 height: 80px;
+    #                 border-radius: 8px;
+    #                 align-items: center;
+    #                 justify-content: center;
+    #             }
+    #             .logo img { height: 25% }
+    #             .avatar-image { background-color: antiquewhite; border-radius: 2px; }
+    #         """
+    #     ) as blocks:
+    #         with gr.Row():
+    #             gr.HTML(f"<div class='logo'>DeepSearch</div>")
+    #         with gr.Row(equal_height=False):
+    #             with gr.Column(scale=3):
+    #                 default_mode = self._default_mode
+    #                 mode = gr.Radio(
+    #                     [m.value for m in MODES],
+    #                     label="Mode",
+    #                     value=default_mode,
+    #                 )
+    #                 explanation_mode = gr.Textbox(
+    #                     placeholder=self._get_default_mode_explanation(default_mode),
+    #                     show_label=False,
+    #                     max_lines=3,
+    #                     interactive=False,
+    #                 )
+    #                 upload_button = gr.components.UploadButton(
+    #                     "Upload File(s)",
+    #                     type="filepath",
+    #                     file_count="multiple",
+    #                     size="sm",
+    #                 )
+    #
+    #                 self._ingested_dataset_component = gr.List(
+    #                     self._list_ingested_files,
+    #                     headers=["File name"],
+    #                     label="Ingested Files",
+    #                     height=235,
+    #                     interactive=False,
+    #                 )
+    #                 upload_button.upload(
+    #                     self._upload_file,
+    #                     inputs=upload_button,
+    #                     outputs=self._ingested_dataset_component,
+    #                 )
+    #
+    #                 self._ingested_dataset_component.change(
+    #                     self._list_ingested_files,
+    #                     outputs=self._ingested_dataset_component,
+    #                 )
+    #                 refresh_button = gr.Button("Refresh Files", size="sm")
+    #                 refresh_button.click(
+    #                     fn=self._refresh_list,
+    #                     inputs=[],
+    #                     outputs=self._ingested_dataset_component
+    #                 )
+    #
+    #                 deselect_file_button = gr.Button("De-select selected file", size="sm", interactive=False)
+    #                 selected_text = gr.Textbox("All files", label="Selected for Query or Deletion", max_lines=1)
+    #                 delete_file_button = gr.Button(
+    #                     "🗑️ Delete selected file",
+    #                     size="sm",
+    #                     visible=settings().ui.delete_file_button_enabled,
+    #                     interactive=False,
+    #                 )
+    #                 delete_files_button = gr.Button(
+    #                     "⚠️ Delete ALL files",
+    #                     size="sm",
+    #                     visible=settings().ui.delete_all_files_button_enabled,
+    #                 )
+    #                 deselect_file_button.click(
+    #                     self._deselect_selected_file,
+    #                     outputs=[delete_file_button, deselect_file_button, selected_text],
+    #                 )
+    #                 self._ingested_dataset_component.select(
+    #                     fn=self._selected_a_file,
+    #                     outputs=[delete_file_button, deselect_file_button, selected_text],
+    #                 )
+    #                 delete_file_button.click(
+    #                     self._delete_selected_file,
+    #                     outputs=[self._ingested_dataset_component, delete_file_button, deselect_file_button, selected_text],
+    #                 )
+    #                 delete_files_button.click(
+    #                     self._delete_all_files,
+    #                     outputs=[self._ingested_dataset_component, delete_file_button, deselect_file_button, selected_text],
+    #                 )
+    #                 system_prompt_input = gr.Textbox(
+    #                     placeholder=self._system_prompt,
+    #                     label="System Prompt",
+    #                     lines=2,
+    #                     interactive=True,
+    #                     render=False,
+    #                 )
+    #                 mode.change(
+    #                     self._set_current_mode,
+    #                     inputs=mode,
+    #                     outputs=[system_prompt_input, explanation_mode],
+    #                 )
+    #                 system_prompt_input.blur(
+    #                     self._set_system_prompt,
+    #                     inputs=system_prompt_input,
+    #                 )
+    #             with gr.Column(scale=7):
+    #                 with gr.Row():
+    #                     query_input = gr.Textbox(label="Enter Query", placeholder="Type your query here", lines=1)
+    #                     run_retrieval_btn = gr.Button("Run Retrieval", variant="primary")
+    #                 with gr.Row():
+    #                     html_original = gr.HTML(label="Original")
+    #                     html_pca = gr.HTML(label="PCA")
+    #                 with gr.Row():
+    #                     html_umap = gr.HTML(label="UMAP")
+    #                     html_ae = gr.HTML(label="AE")
+    #                 with gr.Row():
+    #                     btn_original = gr.Button("Submit Original")
+    #                     btn_pca = gr.Button("Submit PCA")
+    #                     btn_umap = gr.Button("Submit UMAP")
+    #                     btn_ae = gr.Button("Submit AE")
+    #                 # Use a Chatbot for displaying LLM answers with streaming updates
+    #                 competitor_answer = gr.Chatbot(label="LLM Answer", elem_classes=["chatbot"])
+    #                 run_retrieval_btn.click(
+    #                     fn=self.run_retrieval,
+    #                     inputs=query_input,
+    #                     outputs=[html_original, html_pca, html_umap, html_ae],
+    #                 )
+    #                 btn_original.click(
+    #                     fn=lambda *args: self.submit_competitor_choice("original", history=competitor_answer.value),
+    #                     inputs=[],
+    #                     outputs=[competitor_answer],
+    #                 )
+    #                 btn_pca.click(
+    #                     fn=lambda *args: self.submit_competitor_choice("pca", history=competitor_answer.value),
+    #                     inputs=[],
+    #                     outputs=[competitor_answer],
+    #                 )
+    #                 btn_umap.click(
+    #                     fn=lambda *args: self.submit_competitor_choice("umap", history=competitor_answer.value),
+    #                     inputs=[],
+    #                     outputs=[competitor_answer],
+    #                 )
+    #                 btn_ae.click(
+    #                     fn=lambda *args: self.submit_competitor_choice("ae", history=competitor_answer.value),
+    #                     inputs=[],
+    #                     outputs=[competitor_answer],
+    #                 )
+    #
+    #     return blocks
 
     def get_ui_blocks(self) -> gr.Blocks:
         if self._ui_block is None:
@@ -696,9 +724,8 @@ class PrivateGptUi:
     def mount_in_app(self, app: FastAPI, path: str) -> None:
         blocks = self.get_ui_blocks()
         blocks.queue()
-        logger.info("Mounting the gradio UI, at path=%s", path)
+        logger.info("Mounting the gradio UI at path=%s", path)
         gr.mount_gradio_app(app, blocks, path=path, favicon_path=AVATAR_BOT)
-
 
 if __name__ == "__main__":
     from private_gpt.di import global_injector

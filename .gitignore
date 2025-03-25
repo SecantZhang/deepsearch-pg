@@ -29,3 +29,10 @@ __pycache__/
 
 # macOS
 .DS_Store
+
+# environment cleaning, adding poetry.lock to avoid the dependencies conflict between linux/windows
+/poetry.lock
+/pyproject.toml
+
+# data
+/private_gpt/data

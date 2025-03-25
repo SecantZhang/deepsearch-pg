@@ -350,7 +350,7 @@ class PrivateGptUi:
             if isinstance(response, ChatResponse):
                 full_response = response.message.content
             else:
-                full_response = str(response)
+                full_response = response.response
 
             # Append the new interaction to the history
             return history + [[self._last_query, full_response]]
@@ -519,8 +519,8 @@ class PrivateGptUi:
                     )
                 with gr.Column(scale=7):
                     with gr.Row():
-                        query_input = gr.Textbox(label="Enter Query", placeholder="Type your query here", lines=1)
-                        run_retrieval_btn = gr.Button("Run Retrieval", variant="primary")
+                        query_input = gr.Textbox(label="Enter Query", placeholder="Type your query here", lines=1, scale=5)
+                        run_retrieval_btn = gr.Button("Run Retrieval", variant="primary", scale=1)
                     with gr.Row():
                         html_original = gr.HTML(label="Original")
                         html_pca = gr.HTML(label="PCA")
